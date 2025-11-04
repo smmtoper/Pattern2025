@@ -5,6 +5,8 @@ import json
 import os
 
 from Src.Logics.models import Warehouse, Transaction
+from Src.Logics.dto import NomenclatureDTO, WarehouseDTO, OSVRowDTO
+
 
 app = connexion.FlaskApp(__name__)
 app.add_api = app  # чтобы использовать Flask API-методы напрямую
@@ -17,7 +19,6 @@ SETTINGS_FILE = "settings.json"
 def load_settings():
     """Загрузка настроек из файла"""
     if not os.path.exists(SETTINGS_FILE):
-        # создаём с настройкой по умолчанию
         settings = {"first_start": True}
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(settings, f, indent=4)
@@ -58,13 +59,29 @@ def start_service():
 
 # ======= Проверка настроек при запуске =======
 settings = load_settings()
+
+# Собираем справочник номенклатур из settings.json (если есть)
+NOMENCLATURES_BY_NAME = {}
+NOMENCLATURES_BY_ID = {}
+if settings.get("default_receipt"):
+    for n in settings["default_receipt"].get("nomenclatures", []):
+        dto = NomenclatureDTO(
+            id=n.get("id"),
+            name=n.get("name"),
+            range_id=n.get("range_id"),
+            category_id=n.get("category_id"),
+        )
+        NOMENCLATURES_BY_NAME[dto.name] = dto
+        if dto.id:
+            NOMENCLATURES_BY_ID[dto.id] = dto
+
 if settings.get("first_start", True):
     start_service()
     settings["first_start"] = False
     save_settings(settings)
 else:
     print("Первый запуск уже выполнен — загружаем данные для текущей сессии")
-    start_service()  # гарантируем, что WAREHOUSES и TRANSACTIONS инициализированы
+    start_service()  # гарантируем, что данные инициализированы
 
 
 # ======= API =======
@@ -75,7 +92,7 @@ def formats():
 
 @app.route("/api/report/osv", methods=['GET'])
 def get_osv():
-    """Отчет ОСВ с учётом всех номенклатур из справочника"""
+    """Отчет ОСВ с возвратом DTO"""
     start_date_str = request.args.get("start_date")
     end_date_str = request.args.get("end_date")
     warehouse_code = request.args.get("warehouse")
@@ -93,40 +110,33 @@ def get_osv():
     if not wh:
         return jsonify({"error": "Склад не найден"}), 404
 
+    warehouse_dto = WarehouseDTO(code=wh.code, name=wh.name)
+
     wh_transactions = [t for t in TRANSACTIONS if t.warehouse.code == warehouse_code]
 
-    # Берём все номенклатуры из справочника
-    nomenclatures = {}
-    if "default_receipt" in settings and "nomenclatures" in settings["default_receipt"]:
-        for n in settings["default_receipt"]["nomenclatures"]:
-            nomenclatures[n["name"]] = n
+    # Список всех номенклатур из справочника
+    all_nomenclatures = dict(NOMENCLATURES_BY_NAME)
 
-    # Инициализируем отчёт по всем номенклатурам справочника
+    # Добавляем те, что появились в транзакциях, но не были в справочнике
+    for t in wh_transactions:
+        if t.nomenclature not in all_nomenclatures:
+            all_nomenclatures[t.nomenclature] = NomenclatureDTO(
+                id=None, name=t.nomenclature
+            )
+
     report = {}
-    for n_name in nomenclatures:
-        report[n_name] = {
-            "nomenclature": n_name,
-            "unit": "шт",  # можно брать из справочника при необходимости
+    for name, n_dto in all_nomenclatures.items():
+        report[name] = {
+            "dto": n_dto,
             "opening_balance": 0,
             "incoming": 0,
             "outgoing": 0,
-            "closing_balance": 0
         }
 
-    # Добавляем данные из транзакций
     for t in wh_transactions:
         n = t.nomenclature
         if n not in report:
-            # если транзакция по новой номенклатуре, которая ещё не в справочнике
-            report[n] = {
-                "nomenclature": n,
-                "unit": t.unit,
-                "opening_balance": 0,
-                "incoming": 0,
-                "outgoing": 0,
-                "closing_balance": 0
-            }
-
+            continue
         if t.date < start_date:
             report[n]["opening_balance"] += t.quantity
         elif start_date <= t.date <= end_date:
@@ -135,11 +145,23 @@ def get_osv():
             else:
                 report[n]["outgoing"] += abs(t.quantity)
 
-    # Рассчитываем конечный остаток
-    for rep in report.values():
-        rep["closing_balance"] = rep["opening_balance"] + rep["incoming"] - rep["outgoing"]
+    # Формируем результат в DTO-формате
+    osv_result = []
+    for name, data in report.items():
+        rep = data
+        closing = rep["opening_balance"] + rep["incoming"] - rep["outgoing"]
+        row_dto = OSVRowDTO(
+            nomenclature=rep["dto"],
+            warehouse=warehouse_dto,
+            unit="шт",
+            opening_balance=rep["opening_balance"],
+            incoming=rep["incoming"],
+            outgoing=rep["outgoing"],
+            closing_balance=closing,
+        )
+        osv_result.append(row_dto.to_dict())
 
-    return jsonify(list(report.values()))
+    return jsonify(osv_result)
 
 
 @app.route("/api/report/save", methods=['POST'])
@@ -147,7 +169,7 @@ def save_data():
     """Сохраняет все данные (склады и транзакции) в JSON"""
     data = {
         "warehouses": [w.to_dict() for w in WAREHOUSES],
-        "transactions": [t.to_dict() for t in TRANSACTIONS]
+        "transactions": [t.to_dict() for t in TRANSACTIONS],
     }
 
     os.makedirs("data", exist_ok=True)
